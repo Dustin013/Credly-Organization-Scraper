@@ -28,7 +28,7 @@ import random
 import string
 import sys
 import time
-from typing import Dict, Iterable
+from typing import Dict, Iterable, TextIO
 
 import requests
 from openpyxl import Workbook
@@ -37,6 +37,7 @@ API_URL = "https://www.credly.com/api/v1/global_search"
 PROFILE_URL_TEMPLATE = "https://www.credly.com/organizations/{slug}/badges"
 PROGRESS_FILE = "credly_orgs_progress.json"
 OUTPUT_FILE = "credly_organizations.xlsx"
+LOG_FILE = "credly_run.log"
 
 # Credly's global_search endpoint returns at most this many hits per query
 # and has no pagination, so any seed that returns exactly RESULT_CAP results
@@ -45,6 +46,37 @@ RESULT_CAP = 50
 # Hard ceiling on how long an auto-generated child query can get. Prevents
 # runaway expansion if Credly ever returns 50 for very long strings.
 MAX_QUERY_LEN = 12
+# Checkpoint cadence -- save progress whichever happens first.
+SAVE_EVERY_N = 25
+SAVE_EVERY_SECS = 30.0
+
+
+class Tee:
+    """Minimal stdout tee that mirrors writes to a log file.
+
+    Lets the script log to ``credly_run.log`` automatically without the
+    user having to ``| tee`` it from the shell. Line-buffered so the log
+    is readable in real time.
+    """
+
+    def __init__(self, *streams: TextIO) -> None:
+        self.streams = streams
+
+    def write(self, data: str) -> int:
+        for s in self.streams:
+            try:
+                s.write(data)
+            except Exception:
+                pass
+        return len(data)
+
+    def flush(self) -> None:
+        for s in self.streams:
+            try:
+                s.flush()
+            except Exception:
+                pass
+
 
 HEADERS = {
     "User-Agent": (
@@ -225,6 +257,13 @@ def write_xlsx(orgs: Dict[str, str], path: str) -> int:
 
 
 def main() -> int:
+    # Mirror everything we print to a log file so progress is captured
+    # without needing a shell `| tee`. Line-buffered for live tailing.
+    log_fp = open(LOG_FILE, "a", buffering=1, encoding="utf-8")
+    sys.stdout = Tee(sys.__stdout__, log_fp)  # type: ignore[assignment]
+    sys.stderr = Tee(sys.__stderr__, log_fp)  # type: ignore[assignment]
+    print(f"\n[run] {time.strftime('%Y-%m-%d %H:%M:%S')} ----------------")
+
     base_seeds = build_seeds()
     orgs, completed, pending = load_progress()
 
@@ -254,6 +293,7 @@ def main() -> int:
     started_at = time.time()
     processed = 0
     capped_expansions = 0
+    last_save = time.time()
 
     try:
         while queue:
@@ -295,22 +335,35 @@ def main() -> int:
                 f"got={len(results):>2} new={new:>2} "
                 f"total_orgs={len(orgs):>5}{tag} ({elapsed:.1f}s)"
             )
-            if processed % 25 == 0:
+            # Checkpoint on whichever fires first: every N queries, or every
+            # SAVE_EVERY_SECS of wall time. Keeps progress.json fresh even on
+            # slow API responses.
+            if (
+                processed % SAVE_EVERY_N == 0
+                or (time.time() - last_save) >= SAVE_EVERY_SECS
+            ):
                 save_progress(orgs, completed, queue)
+                last_save = time.time()
             # Polite jitter between calls.
             time.sleep(random.uniform(1.0, 2.5))
     except KeyboardInterrupt:
-        print("\n[interrupt] saving progress and exiting...")
+        print("\n[interrupt] saving progress and writing partial xlsx...")
     finally:
         save_progress(orgs, completed, queue)
-
-    rows = write_xlsx(orgs, OUTPUT_FILE)
-    total_elapsed = time.time() - started_at
-    print(
-        f"[done] wrote {rows} rows -> {OUTPUT_FILE} "
-        f"(unique slugs={len(orgs)}, capped_expansions={capped_expansions}, "
-        f"runtime={total_elapsed/60:.1f} min)"
-    )
+        # Always write the xlsx -- even on interrupt -- so the user gets
+        # a usable snapshot of everything found so far.
+        try:
+            rows = write_xlsx(orgs, OUTPUT_FILE)
+        except Exception as e:
+            rows = -1
+            print(f"[warn] failed to write xlsx: {e!r}")
+        total_elapsed = time.time() - started_at
+        print(
+            f"[done] wrote {rows} rows -> {OUTPUT_FILE} "
+            f"(unique slugs={len(orgs)}, capped_expansions={capped_expansions}, "
+            f"queue_remaining={len(queue)}, runtime={total_elapsed/60:.1f} min)"
+        )
+        log_fp.close()
     return 0
 
 

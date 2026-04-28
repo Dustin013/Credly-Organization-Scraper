@@ -65,15 +65,30 @@ python credly.py
 You'll see a progress line per seed query, e.g.:
 
 ```
-[start] seeds total=778 done=0 remaining=778 known_orgs=0
-[   1/778] q='0'      got=12 new=12 total_orgs=   12 (1.4s)
-[   2/778] q='1'      got= 8 new= 7 total_orgs=   19 (1.6s)
+[start] base_seeds=848 done=0 queue=848 known_orgs=0
+[    1|q= 847] q='0'            got= 0 new= 0 total_orgs=    0 (0.6s)
+[   11|q= 837] q='a'            got=50 new=50 total_orgs=   50 +26 (0.5s)
 ...
-[done] wrote 4231 rows -> credly_organizations.xlsx (unique slugs=4231, runtime=18.7 min)
+[done] wrote 4231 rows -> credly_organizations.xlsx (unique slugs=4231, capped_expansions=124, queue_remaining=0, runtime=42.7 min)
 ```
 
-When the run finishes (or you stop it with `Ctrl+C`), the script writes
-`credly_organizations.xlsx`.
+The `[N|q=K]` prefix shows the Nth processed query and `K` queries
+still in the queue. A trailing `+N` means the query hit the 50‑result
+cap and `N` child queries were auto-queued for drill-down.
+
+**Logging.** Everything printed to the terminal is also appended to
+`credly_run.log` automatically — no need to pipe through `tee`. Tail it
+from another terminal to watch progress live:
+
+```bash
+tail -f credly_run.log
+```
+
+**Checkpointing.** Progress is saved to `credly_orgs_progress.json`
+every 25 queries *or* every 30 seconds, whichever comes first. The
+final `credly_organizations.xlsx` is written at the end of the run
+**and also when you `Ctrl+C`**, so an interrupted run still produces a
+usable snapshot of everything found so far.
 
 ### Resuming an interrupted run
 
@@ -108,8 +123,9 @@ Rows are sorted alphabetically (case‑insensitive) by organization name.
 |-------------------------------|------------------------------------------------------------|
 | `credly.py`                   | The scraper.                                               |
 | `requirements.txt`            | Python dependencies.                                       |
-| `credly_organizations.xlsx`   | Final output (generated).                                  |
-| `credly_orgs_progress.json`   | Resume cache: discovered orgs + completed seeds (generated). |
+| `credly_organizations.xlsx`   | Final output (generated, also written on `Ctrl+C`).        |
+| `credly_orgs_progress.json`   | Resume cache: discovered orgs, completed seeds, pending drill-down queue (generated). |
+| `credly_run.log`              | Auto-appended log of every run (generated).                |
 
 ---
 
@@ -119,6 +135,10 @@ A few constants near the top of `credly.py` you may want to tweak:
 
 - `KEYWORD_SEEDS` — add domain‑specific terms to surface more orgs in
   niches you care about.
+- `SAVE_EVERY_N` / `SAVE_EVERY_SECS` — how often progress is checkpointed
+  to `credly_orgs_progress.json` (default: every 25 queries or 30 seconds).
+- `MAX_QUERY_LEN` — hard cap on auto-generated drill-down query length
+  (default: 12).
 - The `time.sleep(random.uniform(1.0, 2.5))` jitter between requests —
   keep it polite. Lowering it materially raises the chance of `429`s.
 - `retries` in `fetch_seed()` — bump if your network is flaky.
