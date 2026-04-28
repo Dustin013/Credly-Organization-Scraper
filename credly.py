@@ -9,8 +9,14 @@ and the response includes up to 50 results of type "Organization" per query.
 There is no pagination on this endpoint, so we issue many seed queries
 (a-z, 0-9, aa-zz, plus topical keywords), dedupe by slug, and export.
 
+Adaptive drill-down: any seed that returns the full 50-result cap is
+almost certainly hiding additional orgs behind it, so we automatically
+queue child queries (e.g. ``in`` -> ``ina..inz``, ``academy`` ->
+``academy a..academy z``) and recurse until the cap is no longer hit.
+
 Output: credly_organizations.xlsx with two columns (Organization Name, URL).
-Resume: credly_orgs_progress.json caches discovered orgs + completed seeds.
+Resume: credly_orgs_progress.json caches discovered orgs, completed seeds,
+        and the pending drill-down queue.
 """
 
 from __future__ import annotations
@@ -31,6 +37,14 @@ API_URL = "https://www.credly.com/api/v1/global_search"
 PROFILE_URL_TEMPLATE = "https://www.credly.com/organizations/{slug}/badges"
 PROGRESS_FILE = "credly_orgs_progress.json"
 OUTPUT_FILE = "credly_organizations.xlsx"
+
+# Credly's global_search endpoint returns at most this many hits per query
+# and has no pagination, so any seed that returns exactly RESULT_CAP results
+# is almost certainly hiding more orgs behind it -- we drill deeper on those.
+RESULT_CAP = 50
+# Hard ceiling on how long an auto-generated child query can get. Prevents
+# runaway expansion if Credly ever returns 50 for very long strings.
+MAX_QUERY_LEN = 12
 
 HEADERS = {
     "User-Agent": (
@@ -136,23 +150,56 @@ def fetch_seed(session: requests.Session, query: str, retries: int = 3) -> list[
     return []
 
 
-def load_progress() -> tuple[Dict[str, str], set[str]]:
-    """Load (orgs_by_slug, completed_seeds) from disk if present."""
+def expand_query(query: str) -> list[str]:
+    """Generate child queries to drill into a capped result set.
+
+    Strategy:
+    - Short tokens (<=4 chars, no spaces): append a-z to extend the prefix,
+      e.g. ``in`` -> ``ina, inb, ..., inz``.
+    - Longer tokens / phrases: append " a" .. " z", which on Credly's
+      substring-style search reliably surfaces a different slice of orgs,
+      e.g. ``academy`` -> ``academy a, academy b, ...``.
+    """
+    q = query.strip()
+    if not q or len(q) >= MAX_QUERY_LEN:
+        return []
+    if len(q) <= 4 and " " not in q:
+        return [q + c for c in string.ascii_lowercase]
+    return [f"{q} {c}" for c in string.ascii_lowercase]
+
+
+def load_progress() -> tuple[Dict[str, str], set[str], list[str]]:
+    """Load (orgs_by_slug, completed_seeds, pending_seeds) from disk."""
     if not os.path.exists(PROGRESS_FILE):
-        return {}, set()
+        return {}, set(), []
     try:
         with open(PROGRESS_FILE, "r", encoding="utf-8") as f:
             blob = json.load(f)
-        return dict(blob.get("orgs", {})), set(blob.get("completed", []))
+        return (
+            dict(blob.get("orgs", {})),
+            set(blob.get("completed", [])),
+            list(blob.get("pending", [])),
+        )
     except Exception as e:
         print(f"[warn] could not read {PROGRESS_FILE}: {e}; starting fresh")
-        return {}, set()
+        return {}, set(), []
 
 
-def save_progress(orgs: Dict[str, str], completed: Iterable[str]) -> None:
+def save_progress(
+    orgs: Dict[str, str],
+    completed: Iterable[str],
+    pending: Iterable[str] = (),
+) -> None:
     tmp = PROGRESS_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"orgs": orgs, "completed": sorted(completed)}, f)
+        json.dump(
+            {
+                "orgs": orgs,
+                "completed": sorted(completed),
+                "pending": list(pending),
+            },
+            f,
+        )
     os.replace(tmp, PROGRESS_FILE)
 
 
@@ -178,19 +225,41 @@ def write_xlsx(orgs: Dict[str, str], path: str) -> int:
 
 
 def main() -> int:
-    seeds = build_seeds()
-    orgs, completed = load_progress()
-    todo = [s for s in seeds if s not in completed]
+    base_seeds = build_seeds()
+    orgs, completed, pending = load_progress()
+
+    # Build the work queue: anything previously queued for drill-down first,
+    # then any base seeds we haven't yet processed. Dedupe against `completed`.
+    queue: list[str] = []
+    seen_in_queue: set[str] = set()
+
+    def enqueue(q: str) -> None:
+        q = q.strip().lower()
+        if not q or q in completed or q in seen_in_queue:
+            return
+        seen_in_queue.add(q)
+        queue.append(q)
+
+    for q in pending:
+        enqueue(q)
+    for q in base_seeds:
+        enqueue(q)
+
     print(
-        f"[start] seeds total={len(seeds)} done={len(completed)} "
-        f"remaining={len(todo)} known_orgs={len(orgs)}"
+        f"[start] base_seeds={len(base_seeds)} done={len(completed)} "
+        f"queue={len(queue)} known_orgs={len(orgs)}"
     )
 
     session = requests.Session()
     started_at = time.time()
+    processed = 0
+    capped_expansions = 0
 
     try:
-        for i, seed in enumerate(todo, 1):
+        while queue:
+            seed = queue.pop(0)
+            seen_in_queue.discard(seed)
+            processed += 1
             t0 = time.time()
             results = fetch_seed(session, seed)
             new = 0
@@ -206,26 +275,41 @@ def main() -> int:
                         new += 1
                     orgs[slug] = name
             completed.add(seed)
+
+            # Adaptive drill-down: if this query saturated the result cap,
+            # there are almost certainly more orgs behind it -- queue child
+            # queries to surface them.
+            expanded = 0
+            if len(results) >= RESULT_CAP:
+                for child in expand_query(seed):
+                    if child not in completed and child not in seen_in_queue:
+                        enqueue(child)
+                        expanded += 1
+                if expanded:
+                    capped_expansions += 1
+
             elapsed = time.time() - t0
+            tag = f" +{expanded}" if expanded else ""
             print(
-                f"[{i:>4}/{len(todo)}] q={seed!r:<8} "
+                f"[{processed:>5}|q={len(queue):>4}] q={seed!r:<14} "
                 f"got={len(results):>2} new={new:>2} "
-                f"total_orgs={len(orgs):>5} ({elapsed:.1f}s)"
+                f"total_orgs={len(orgs):>5}{tag} ({elapsed:.1f}s)"
             )
-            if i % 25 == 0:
-                save_progress(orgs, completed)
+            if processed % 25 == 0:
+                save_progress(orgs, completed, queue)
             # Polite jitter between calls.
             time.sleep(random.uniform(1.0, 2.5))
     except KeyboardInterrupt:
         print("\n[interrupt] saving progress and exiting...")
     finally:
-        save_progress(orgs, completed)
+        save_progress(orgs, completed, queue)
 
     rows = write_xlsx(orgs, OUTPUT_FILE)
     total_elapsed = time.time() - started_at
     print(
         f"[done] wrote {rows} rows -> {OUTPUT_FILE} "
-        f"(unique slugs={len(orgs)}, runtime={total_elapsed/60:.1f} min)"
+        f"(unique slugs={len(orgs)}, capped_expansions={capped_expansions}, "
+        f"runtime={total_elapsed/60:.1f} min)"
     )
     return 0
 

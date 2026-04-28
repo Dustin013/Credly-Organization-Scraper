@@ -27,9 +27,18 @@ issues a large set of seed queries, then dedupes the results by slug:
 - every two‑letter combination `aa`–`zz` (676 queries)
 - a curated list of topical keywords (industries, vendors, regions, etc.)
 
-Discovered organizations and the list of completed seeds are persisted to
-`credly_orgs_progress.json` after every 25 queries, so the run is fully
-**resumable** — re-running the script picks up where it left off.
+**Adaptive drill-down.** Because the API caps at 50, any seed that
+returns exactly 50 results is hiding more organizations behind it. The
+scraper auto-queues child queries for every capped seed and recurses
+until the cap is no longer hit:
+
+- short tokens like `in` → `ina, inb, …, inz`
+- longer keywords like `academy` → `academy a, academy b, …, academy z`
+
+Discovered organizations, the list of completed seeds, **and the
+pending drill-down queue** are persisted to `credly_orgs_progress.json`
+after every 25 queries, so the run is fully **resumable** — re-running
+the script picks up where it left off.
 
 ---
 
