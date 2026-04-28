@@ -46,6 +46,12 @@ RESULT_CAP = 50
 # Hard ceiling on how long an auto-generated child query can get. Prevents
 # runaway expansion if Credly ever returns 50 for very long strings.
 MAX_QUERY_LEN = 12
+# Maximum number of word-suffix drill-downs allowed on a phrase query.
+# e.g. depth=1 allows ``academy`` -> ``academy a..z`` but blocks
+# ``academy a`` -> ``academy a a..z``. Past depth 1 the API tends to keep
+# returning the cap with 0 new results because the trailing single letters
+# don't meaningfully narrow the substring match.
+MAX_PHRASE_DEPTH = 1
 # Checkpoint cadence -- save progress whichever happens first.
 SAVE_EVERY_N = 25
 SAVE_EVERY_SECS = 30.0
@@ -190,13 +196,17 @@ def expand_query(query: str) -> list[str]:
       e.g. ``in`` -> ``ina, inb, ..., inz``.
     - Longer tokens / phrases: append " a" .. " z", which on Credly's
       substring-style search reliably surfaces a different slice of orgs,
-      e.g. ``academy`` -> ``academy a, academy b, ...``.
+      e.g. ``academy`` -> ``academy a, academy b, ...``. Bounded by
+      ``MAX_PHRASE_DEPTH`` so we don't recurse forever on broad terms.
     """
     q = query.strip()
     if not q or len(q) >= MAX_QUERY_LEN:
         return []
     if len(q) <= 4 and " " not in q:
         return [q + c for c in string.ascii_lowercase]
+    # Phrase / longer-token expansion -- enforce depth limit.
+    if q.count(" ") >= MAX_PHRASE_DEPTH:
+        return []
     return [f"{q} {c}" for c in string.ascii_lowercase]
 
 
@@ -269,12 +279,30 @@ def main() -> int:
 
     # Build the work queue: anything previously queued for drill-down first,
     # then any base seeds we haven't yet processed. Dedupe against `completed`.
+    # Drop any pending entry that violates the current expansion rules
+    # (e.g. left over from before MAX_PHRASE_DEPTH existed) so we don't waste
+    # requests grinding through a queue that can never produce new results.
     queue: list[str] = []
     seen_in_queue: set[str] = set()
+    pruned = 0
+
+    def is_allowed(q: str) -> bool:
+        if len(q) > MAX_QUERY_LEN:
+            return False
+        # Phrase queries deeper than MAX_PHRASE_DEPTH almost never yield new
+        # orgs -- they hit the cap because Credly's search loosely matches
+        # the leading token and ignores the trailing single letters.
+        if " " in q and q.count(" ") > MAX_PHRASE_DEPTH:
+            return False
+        return True
 
     def enqueue(q: str) -> None:
+        nonlocal pruned
         q = q.strip().lower()
         if not q or q in completed or q in seen_in_queue:
+            return
+        if not is_allowed(q):
+            pruned += 1
             return
         seen_in_queue.add(q)
         queue.append(q)
@@ -286,7 +314,7 @@ def main() -> int:
 
     print(
         f"[start] base_seeds={len(base_seeds)} done={len(completed)} "
-        f"queue={len(queue)} known_orgs={len(orgs)}"
+        f"queue={len(queue)} pruned_pending={pruned} known_orgs={len(orgs)}"
     )
 
     session = requests.Session()
@@ -316,20 +344,33 @@ def main() -> int:
                     orgs[slug] = name
             completed.add(seed)
 
-            # Adaptive drill-down: if this query saturated the result cap,
-            # there are almost certainly more orgs behind it -- queue child
-            # queries to surface them.
+            # Adaptive drill-down: only worth doing if (a) we hit the cap AND
+            # (b) this query actually surfaced new orgs. A capped query that
+            # produced 0 new orgs means the result set is already fully
+            # captured by some broader query upstream -- drilling deeper into
+            # the same lexical neighborhood will just keep returning the same
+            # 50 already-known slugs. Skipping these is the single biggest
+            # speed win once the easy wins have been collected.
             expanded = 0
+            skipped_unproductive = False
             if len(results) >= RESULT_CAP:
-                for child in expand_query(seed):
-                    if child not in completed and child not in seen_in_queue:
-                        enqueue(child)
-                        expanded += 1
-                if expanded:
-                    capped_expansions += 1
+                if new > 0:
+                    for child in expand_query(seed):
+                        if child not in completed and child not in seen_in_queue:
+                            enqueue(child)
+                            expanded += 1
+                    if expanded:
+                        capped_expansions += 1
+                else:
+                    skipped_unproductive = True
 
             elapsed = time.time() - t0
-            tag = f" +{expanded}" if expanded else ""
+            if expanded:
+                tag = f" +{expanded}"
+            elif skipped_unproductive:
+                tag = " skip"
+            else:
+                tag = ""
             print(
                 f"[{processed:>5}|q={len(queue):>4}] q={seed!r:<14} "
                 f"got={len(results):>2} new={new:>2} "
