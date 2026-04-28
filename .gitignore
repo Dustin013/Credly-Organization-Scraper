@@ -1,0 +1,21 @@
+# Generated output / runtime state
+credly_organizations.xlsx
+credly_orgs_progress.json
+credly_orgs_progress.json.tmp
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
